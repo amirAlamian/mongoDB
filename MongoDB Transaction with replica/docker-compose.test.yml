@@ -1,0 +1,110 @@
+version: "3.7"
+
+services:
+  casitt-mongo-test:
+    container_name: casitt-mongo-test
+    restart: always
+    image: mongo:4
+    entrypoint:
+      ["/usr/bin/mongod", "--bind_ip_all", "--replSet", "my_custom_rep"]
+    volumes:
+      - casitt-mongo-data-test:/data/db
+    ports:
+      - "28028:27017"
+    networks:
+      - casitt-net-test
+  casitt-mongo-replica-test:
+    container_name: casitt-mongo-replica-test
+    restart: always
+    expose:
+      - 27017
+    entrypoint:
+      ["/usr/bin/mongod", "--bind_ip_all", "--replSet", "my_custom_rep"]
+    image: mongo:4
+    networks:
+      - casitt-net-test
+  mongo-setup-test:
+    container_name: mongo-setup
+    image: mongo:4
+    restart: on-failure
+    volumes:
+      - ./mongo:/mongo
+    entrypoint: ["/mongo/setup.test.sh"] # Make sure this file exists (see below for the setup.sh)
+    depends_on:
+      - casitt-mongo-test
+      - casitt-mongo-replica-test
+      - casitt-product-template-test
+    networks:
+      - casitt-net-test
+  casitt-gateway-test:
+    container_name: casitt-gateway-test
+    # restart: always
+    # image: 192.168.10.193:8090/pim/origin:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_gateway:/app
+    tty: true
+    ports:
+      - "9084:3000"
+    environment:
+      - "NODE_ENV=test"
+      - "jwt=123456"
+      - "PORT=3000"
+    networks:
+      - casitt-net-test
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+  casitt-redis-test:
+    container_name: casitt-redis-test
+    image: redis:5.0.8
+    networks:
+      - casitt-net-test
+    # restart: always
+    ports:
+      - "6390:6379"
+
+  casitt-product-template-test:
+    container_name: casitt-product-template-test
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_product_template:/app
+    tty: true
+    ports:
+      - "9083:3000"
+    environment:
+      - "NODE_ENV=test"
+      - "jwt=123456"
+      - "PORT=3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && npm run test:integration",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net-test
+
+secrets:
+  kong_postgres_password:
+    file: ./POSTGRES_PASSWORD
+
+volumes:
+  casitt-mongo-data-test:
+
+networks:
+  casitt-net-test:

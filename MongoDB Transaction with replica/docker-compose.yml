@@ -1,0 +1,643 @@
+version: "3.7"
+
+services:
+  ##################################################################
+  # Global Services
+  ##################################################################
+  casitt-minio:
+    container_name: casitt-minio
+    restart: always
+    build:
+      context: .
+      dockerfile: ./minio/Dockerfile
+    volumes:
+      - casitt-minio-data:/data
+    ports:
+      - "9000:9000"
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-zookeeper:
+    container_name: casitt-zookeeper
+    image: wurstmeister/zookeeper
+    ports:
+      - "2181:2181"
+    restart: always
+    networks:
+      - casitt-net
+  casitt-kafka:
+    container_name: casitt-kafka
+    image: wurstmeister/kafka
+    restart: always
+    ports:
+      - "9092:9092"
+    networks:
+      - casitt-net
+    environment:
+      KAFKA_ADVERTISED_HOST_NAME: $KAFKA_ADVERTISED_HOST_NAME
+      KAFKA_ZOOKEEPER_CONNECT: casitt-zookeeper:2181
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - casitt-kafka-data:/var/lib/kafka/data
+    networks:
+      - casitt-net
+  casitt-kafdrop:
+    restart: always
+    image: obsidiandynamics/kafdrop
+    ports:
+      - "9003:9000"
+    depends_on: ["casitt-kafka", "casitt-zookeeper"]
+    environment:
+      KAFKA_BROKERCONNECT: casitt-kafka:9092
+    networks:
+      - casitt-net
+  # *****************************************************
+  # ----------------Gateway Configuration----------------
+  # *****************************************************
+  casitt-gateway:
+    container_name: casitt-gateway
+    restart: always
+    # image: 192.168.10.193:8090/casitt/origin:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_gateway:/app
+    tty: true
+    ports:
+      - "9081:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    networks:
+      - casitt-net
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+  casitt-kong-migrations:
+    container_name: casitt-kong-migrations
+    image: "${KONG_DOCKER_TAG:-kong:latest}"
+    command: kong migrations bootstrap
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_DATABASE: ${KONG_PG_DATABASE:-kong}
+      KONG_PG_HOST: 'casitt-kong-db'
+      KONG_PG_USER: ${KONG_PG_USER:-kong}
+      KONG_PG_PASSWORD_FILE: /run/secrets/kong_postgres_password
+    secrets:
+      - kong_postgres_password
+    networks:
+      - kong-net
+    restart: on-failure
+    # depends_on:
+    #   - casitt-kong-db
+  casitt-kong-migrations-up:
+    container_name: casitt-kong-migrations-up
+    image: "${KONG_DOCKER_TAG:-kong:latest}"
+    command: kong migrations up && kong migrations finish
+    # depends_on:
+    #   - casitt-kong-db
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_DATABASE: ${KONG_PG_DATABASE:-kong}
+      KONG_PG_HOST: 'casitt-kong-db'
+      KONG_PG_USER: ${KONG_PG_USER:-kong}
+      KONG_PG_PASSWORD_FILE: /run/secrets/kong_postgres_password
+    secrets:
+      - kong_postgres_password
+    networks:
+      - kong-net
+    restart: on-failure
+  casitt-kong:
+    container_name: casitt-kong
+    image: "${KONG_DOCKER_TAG:-kong:latest}"
+    user: "${KONG_USER:-kong}"
+    # depends_on:
+    #   - casitt-kong-db
+    environment:
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_CASSANDRA_CONTACT_POINTS: 'casitt-kong-db'
+      KONG_DATABASE: postgres
+      KONG_PG_DATABASE: ${KONG_PG_DATABASE:-kong}
+      KONG_PG_HOST: 'casitt-kong-db'
+      KONG_PG_USER: ${KONG_PG_USER:-kong}
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_PG_PASSWORD_FILE: /run/secrets/kong_postgres_password
+    secrets:
+      - kong_postgres_password
+    networks:
+      - kong-net
+      - casitt-net
+    ports:
+      - "8000:8000/tcp"
+      - "127.0.0.1:8001:8001/tcp"
+      - "8443:8443/tcp"
+      - "127.0.0.1:8444:8444/tcp"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: on-failure
+  casitt-kong-db:
+    container_name: casitt-kong-db
+    # image: 'http://192.168.10.197:5432'
+    image: postgres:9.5
+    environment:
+      POSTGRES_DB: ${KONG_PG_DATABASE:-kong}
+      POSTGRES_USER: ${KONG_PG_USER:-kong}
+      POSTGRES_PASSWORD_FILE: /run/secrets/kong_postgres_password
+    secrets:
+      - kong_postgres_password
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${KONG_PG_USER:-kong}"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+    restart: on-failure
+    stdin_open: true
+    tty: true
+    ports:
+      - "5432:5432"
+    networks:
+      - kong-net
+    volumes:
+      - casitt-kong-data:/var/lib/postgresql/data
+  konga-prepare:
+    image: pantsel/konga:next
+    command: "-c prepare -a postgres -u postgresql://kong:kong@casitt-kong-db/konga_db"
+    networks:
+      - kong-net
+    restart: on-failure
+    # links:
+    #   - casitt-kong-db
+    # depends_on:
+    #   - casitt-kong-db
+  casitt-konga:
+    container_name: casitt-konga
+    image: pantsel/konga:next
+    ports:
+      - 1337:1337
+    environment:
+      DB_ADAPTER: postgres
+      DB_DATABASE: konga_db
+      DB_HOST: 'casitt-kong-db'
+      DB_USER: kong
+      DB_PASSWORD: kong
+      KONGA_SEED_USER_DATA_SOURCE_FILE: /konga_users.js
+      NODE_ENV: production
+    networks:
+      - kong-net
+    volumes:
+      - ./konga_users.js:/konga_users.js:ro
+    restart: on-failure
+  # *****************************************************
+  casitt-mongo:
+    container_name: casitt-mongo
+    restart: always
+    image: mongo:4
+    entrypoint:
+      ["/usr/bin/mongod", "--bind_ip_all", "--replSet", "my_custom_rep"]
+    volumes:
+      - casitt-mongo-data:/data/db
+    ports:
+      - "27027:27017"
+    networks:
+      - casitt-net
+  casitt-mongo-replica:
+    container_name: casitt-mongo-replica
+    restart: always
+    ports:
+      - "27028:27017"
+    entrypoint:
+      ["/usr/bin/mongod", "--bind_ip_all", "--replSet", "my_custom_rep"]
+    image: mongo:4
+    networks:
+      - casitt-net
+  mongo-setup:
+    container_name: mongo-setup
+    image: mongo:4
+    restart: on-failure
+    volumes:
+      - ./mongo:/mongo
+    entrypoint: ["/mongo/setup.sh"] # Make sure this file exists (see below for the setup.sh)
+    depends_on:
+      - casitt-mongo
+      - casitt-mongo-replica
+      - casitt-product-template
+    networks:
+      - casitt-net
+  casitt-user:
+    container_name: casitt-user
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_user_management:/app
+    tty: true
+    ports:
+      - "9082:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    depends_on:
+      ["casitt-mongo", "casitt-redis", "casitt-category", "casitt-setting"]
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && /usr/local/wait-for-it.sh casitt-category:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-setting:
+    container_name: casitt-setting
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_setting:/app
+    tty: true
+    ports:
+      - "9090:3000"
+    command: ["sh", "-c", "ls && npm install && npm run dev"]
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    depends_on: ["casitt-kafka","casitt-mongo", "casitt-zookeeper"]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-category:
+    container_name: casitt-category
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_category:/app
+    tty: true
+    ports:
+      - "9087:3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-redis:
+    container_name: casitt-redis
+    image: redis:5.0.8
+    networks:
+      - casitt-net
+    restart: always
+    ports:
+      - "6379:6379"
+  casitt-product-template:
+    container_name: casitt-product-template
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_product_template:/app
+    tty: true
+    ports:
+      - "9096:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    command:
+      [
+        "sh",
+        "-c",
+        "ls && npm install && npm run dev && npm run run-seeder -- createField",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-captcha:
+    container_name: casitt-captcha
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_captcha:/app
+    tty: true
+    ports:
+      - "9091:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    depends_on: ["casitt-redis"]
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-sms:
+    container_name: casitt-sms
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_sms:/app
+    ports:
+      - "8094:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    depends_on:
+      [
+        "casitt-notification",
+        "casitt-kafka",
+        "casitt-zookeeper"
+      ]
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-notification:3000
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-orchestrator:
+    container_name: casitt-orchestrator
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_saga_orchestrator:/app
+    tty: true
+    ports:
+      - "9094:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "PORT=3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-cities:
+    container_name: casitt-cities
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_cities:/app
+    tty: true
+    ports:
+      - "9089:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-notification:
+    container_name: casitt-notification
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_notification:/app
+    tty: true
+    ports:
+      - "9088:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      casitt-net:
+
+  casitt-fs:
+    container_name: casitt-fs
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_fs:/app
+    tty: true
+    ports:
+      - "9086:3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-minio:9000
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-chart:
+    container_name: casitt-chart
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_orgchart:/app
+    tty: true
+    ports:
+      - "9085:3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm install && npm run dev",
+      ]
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-branch:
+    container_name: casitt-branch
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_branch:/app
+    tty: true
+    ports:
+      - "9083:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-email:
+    container_name: casitt-email
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_email:/app
+    tty: true
+    ports:
+      - "9093:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    depends_on: ["casitt-kafka", "casitt-zookeeper"]
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+  casitt-company:
+    container_name: casitt-company
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../backend_company:/app
+    tty: true
+    ports:
+      - "9084:3000"
+    environment:
+      - "NODE_ENV=docker"
+      - "jwt=123456"
+      - "PORT=3000"
+    depends_on: ["casitt-mongo", "casitt-redis", "casitt-cities"]
+    command: [
+        "sh",
+        "-c",
+        "ls
+        && npm install
+        && /usr/local/wait-for-it.sh casitt-cities:3000
+        && /usr/local/wait-for-it.sh casitt-setting:3000
+        && npm run dev",
+      ]
+    env_file:
+      - .env
+    networks:
+      - casitt-net
+secrets:
+  kong_postgres_password:
+    file: ./POSTGRES_PASSWORD
+
+volumes:
+  casitt-konga_data: {}
+  casitt-kong-data:
+  casitt-mongo-data:
+  casitt-elasticsearch:
+  casitt-minio-data:
+  casitt-kafka-data:
+
+networks:
+  kong-net:
+    external: false
+  casitt-net:
